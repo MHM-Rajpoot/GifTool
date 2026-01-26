@@ -1,0 +1,19 @@
+[project]
+name = "gif-tool"
+version = "0.1.0"
+description = "CLI and library to convert videos to GIFs with basic validations"
+readme = "README.md"
+authors = [{ name = "MHM" }]
+requires-python = ">=3.10"
+dependencies = [
+  "opencv-python",
+  "imageio",
+  "numpy",
+]
+
+[project.scripts]
+gif-tool = "gif_tool.cli:main"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
