@@ -9,9 +9,9 @@ from .converter import GifSettings, convert_to_gif, derive_output_path
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Convert a video to a GIF with basic validations and sensible defaults.",
+        description="Convert a video or a directory of images to a GIF with sensible defaults.",
     )
-    parser.add_argument("input", help="Path to the source video file")
+    parser.add_argument("input", help="Path to the source video file or directory of images")
     parser.add_argument(
         "-o",
         "--output",
@@ -36,10 +36,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reject videos longer than this many seconds",
     )
     parser.add_argument(
-        "--target-duration",
-        type=int,
-        default=15,
-        help="Target GIF duration in seconds (will trim if video is longer)",
+        "--per-image-duration",
+        type=float,
+        default=1.0,
+        help="Seconds to display each image when input is a folder (default: 1.0)",
     )
     parser.add_argument(
         "--max-size-mb",
@@ -64,14 +64,14 @@ def main() -> None:
     settings = GifSettings(
         max_size_mb=args.max_size_mb,
         max_length_sec=args.max_duration,
-        target_gif_sec=args.target_duration,
         max_width=args.max_width,
     )
+    per_image_duration = args.per_image_duration
 
     input_path = Path(args.input)
     output_path = derive_output_path(input_path, args.output)
 
-    result_path = convert_to_gif(input_path, output_path, args.fps, settings)
+    result_path = convert_to_gif(input_path, output_path, args.fps, settings, per_image_duration)
     print(f"GIF written to {result_path}")
 
 

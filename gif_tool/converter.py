@@ -7,6 +7,7 @@ from typing import List, Tuple
 
 import cv2
 import imageio
+from PIL import Image as PILImage
 import numpy as np
 
 
@@ -16,7 +17,6 @@ class GifSettings:
 
     max_size_mb: int = 25
     max_length_sec: int = 60
-    target_gif_sec: int = 15
     max_width: int = 480
     default_fps: float = 10.0
     max_fps: float = 10.0
@@ -29,14 +29,23 @@ class VideoMeta:
     duration: float | None
 
 
-def validate_file(path: Path, settings: GifSettings) -> None:
-    if not path.exists() or not path.is_file():
-        raise FileNotFoundError(f"Input file not found: {path}")
-    size_mb = path.stat().st_size / (1024 * 1024)
-    if size_mb > settings.max_size_mb:
-        raise ValueError(
-            f"Input file is {size_mb:.2f} MB (> {settings.max_size_mb} MB limit)"
-        )
+def validate_input(path: Path, settings: GifSettings) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"Input not found: {path}")
+
+    # If given a file, validate size. If a directory, ensure it contains images.
+    if path.is_file():
+        size_mb = path.stat().st_size / (1024 * 1024)
+        if size_mb > settings.max_size_mb:
+            raise ValueError(
+                f"Input file is {size_mb:.2f} MB (> {settings.max_size_mb} MB limit)"
+            )
+
+
+def _collect_image_files(folder: Path) -> list[Path]:
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif", ".gif"}
+    imgs = sorted([p for p in folder.iterdir() if p.suffix.lower() in exts and p.is_file()])
+    return imgs
 
 
 def derive_output_path(input_path: Path, output: str | None) -> Path:
@@ -94,9 +103,66 @@ def convert_to_gif(
     output_path: Path,
     override_fps: float | None = None,
     settings: GifSettings | None = None,
+    per_image_duration: float | None = None,
 ) -> Path:
     cfg = settings or GifSettings()
-    validate_file(input_path, cfg)
+    # If input is a directory of images, create GIF from images.
+    if input_path.is_dir():
+        imgs = _collect_image_files(input_path)
+        if not imgs:
+            raise ValueError(f"No image files found in folder: {input_path}")
+
+        # Use provided per-image duration (CLI default is 1.0s).
+        if per_image_duration is None:
+            per_image_duration = 1.0
+
+        frames: list[np.ndarray] = []
+        target_h = target_w = None
+
+        for p in imgs:
+            img = imageio.imread(p)
+            if img.ndim == 2:
+                img = np.stack([img, img, img], axis=2)
+            if img.shape[2] == 4:
+                img = img[:, :, :3]
+
+            h, w = img.shape[:2]
+            if w > cfg.max_width:
+                scale = cfg.max_width / w
+                new_w, new_h = int(w * scale), int(h * scale)
+                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                h, w = img.shape[:2]
+
+            if target_h is None:
+                target_h, target_w = h, w
+            else:
+                if (h, w) != (target_h, target_w):
+                    img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+            frames.append(img)
+
+        logging.info(
+            "Collected %d images, per-image duration=%.3fs, writing GIF to %s",
+            len(frames),
+            per_image_duration,
+            output_path,
+        )
+        # Write using Pillow to ensure per-frame durations are stored (ms).
+        pil_frames = [PILImage.fromarray(f) for f in frames]
+        durations_ms = [int(per_image_duration * 1000)] * len(pil_frames)
+        first, rest = pil_frames[0], pil_frames[1:]
+        first.save(
+            output_path,
+            save_all=True,
+            append_images=rest,
+            duration=durations_ms,
+            loop=0,
+            format="GIF",
+        )
+        return output_path
+
+    # Otherwise treat input as a video file
+    validate_input(input_path, cfg)
 
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
@@ -114,7 +180,8 @@ def convert_to_gif(
                 f"Video is {meta.duration:.2f}s (> {cfg.max_length_sec}s limit)"
             )
 
-        clip_duration = min(cfg.target_gif_sec, meta.duration) if meta.duration else cfg.target_gif_sec
+        # For videos, keep the full video length (up to max_length_sec); do not use a target duration.
+        clip_duration = min(meta.duration, cfg.max_length_sec) if meta.duration else cfg.max_length_sec
         logging.info("Processing video at %.1f fps for %.1f s", fps, clip_duration)
         frames, frame_duration = read_frames(cap, fps, clip_duration, cfg)
         logging.info("Extracted %d frames, writing GIF to %s", len(frames), output_path)
