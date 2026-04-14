@@ -20,6 +20,7 @@ class GifSettings:
     max_width: int = 480
     default_fps: float = 10.0
     max_fps: float = 10.0
+    max_frames: int = 150
 
 
 @dataclass
@@ -27,6 +28,25 @@ class VideoMeta:
     fps: float
     frame_count: int
     duration: float | None
+
+
+@dataclass
+class BatchConversionFailure:
+    input_path: Path
+    error: str
+
+
+class BatchConversionError(RuntimeError):
+    def __init__(
+        self,
+        successes: list[Path],
+        failures: list[BatchConversionFailure],
+    ) -> None:
+        self.successes = successes
+        self.failures = failures
+        super().__init__(
+            f"Converted {len(successes)} video(s) with {len(failures)} failure(s)"
+        )
 
 
 def validate_input(path: Path, settings: GifSettings) -> None:
@@ -48,11 +68,25 @@ def _collect_image_files(folder: Path) -> list[Path]:
     return imgs
 
 
+def _collect_video_files(folder: Path) -> list[Path]:
+    exts = {".mov", ".mp4", ".avi", ".mkv", ".webm", ".m4v"}
+    videos = sorted(
+        [p for p in folder.iterdir() if p.suffix.lower() in exts and p.is_file()]
+    )
+    return videos
+
+
 def derive_output_path(input_path: Path, output: str | None) -> Path:
     if output:
         out_path = Path(output)
         return out_path if out_path.suffix.lower() == ".gif" else out_path.with_suffix(".gif")
     return input_path.with_suffix(".gif")
+
+
+def derive_batch_output_dir(input_dir: Path, output_dir: str | None) -> Path:
+    if output_dir:
+        return Path(output_dir)
+    return input_dir.parent / "gif"
 
 
 def probe_video(cap: cv2.VideoCapture) -> VideoMeta:
@@ -64,6 +98,33 @@ def probe_video(cap: cv2.VideoCapture) -> VideoMeta:
     return VideoMeta(fps=fps, frame_count=frame_count, duration=duration)
 
 
+def resolve_output_fps(
+    meta: VideoMeta,
+    settings: GifSettings,
+    override_fps: float | None = None,
+) -> float:
+    fps = meta.fps if meta.fps > 0 else settings.default_fps
+    if override_fps is not None and override_fps > 0:
+        fps = override_fps
+    fps = min(fps, settings.max_fps)
+
+    if meta.duration and meta.duration > 0 and settings.max_frames > 0:
+        budget_fps = settings.max_frames / meta.duration
+        min_useful_fps = 1.0 / meta.duration
+        auto_fps = max(min_useful_fps, budget_fps)
+        if auto_fps < fps:
+            logging.info(
+                "Reducing fps from %.2f to %.2f to stay within ~%d frames for %.2fs video",
+                fps,
+                auto_fps,
+                settings.max_frames,
+                meta.duration,
+            )
+            fps = auto_fps
+
+    return fps
+
+
 def read_frames(
     cap: cv2.VideoCapture,
     fps: float,
@@ -71,16 +132,20 @@ def read_frames(
     settings: GifSettings,
 ) -> Tuple[List[np.ndarray], float]:
     frames: List[np.ndarray] = []
-    target_frames = max(1, int(round(clip_duration * fps)))  # frames = t * fps
     frame_duration = 1.0 / fps if fps > 0 else 0.1
+    next_sample_time = 0.0
 
-    while len(frames) < target_frames:
+    while True:
         ok, frame = cap.read()
         if not ok:
             break
         pos_sec = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
         if pos_sec > settings.max_length_sec:
             raise ValueError("Video exceeds length limit")
+        if clip_duration > 0 and pos_sec > clip_duration:
+            break
+        if frames and pos_sec + 1e-9 < next_sample_time:
+            continue
 
         # Downscale wide frames to keep GIF size reasonable.
         h, w = frame.shape[:2]
@@ -91,11 +156,14 @@ def read_frames(
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frames.append(rgb)
+        next_sample_time += frame_duration
+        if clip_duration > 0 and next_sample_time > clip_duration:
+            break
 
     if not frames:
         raise ValueError("No frames could be read from the video")
 
-    return frames, frame_duration
+    return frames, clip_duration / len(frames) if clip_duration > 0 else frame_duration
 
 
 def convert_to_gif(
@@ -170,10 +238,6 @@ def convert_to_gif(
 
     try:
         meta = probe_video(cap)
-        fps = meta.fps if meta.fps > 0 else cfg.default_fps
-        if override_fps is not None and override_fps > 0:
-            fps = override_fps
-        fps = min(fps, cfg.max_fps)
 
         if meta.duration is not None and meta.duration > cfg.max_length_sec:
             raise ValueError(
@@ -182,6 +246,7 @@ def convert_to_gif(
 
         # For videos, keep the full video length (up to max_length_sec); do not use a target duration.
         clip_duration = min(meta.duration, cfg.max_length_sec) if meta.duration else cfg.max_length_sec
+        fps = resolve_output_fps(meta, cfg, override_fps)
         logging.info("Processing video at %.1f fps for %.1f s", fps, clip_duration)
         frames, frame_duration = read_frames(cap, fps, clip_duration, cfg)
         logging.info("Extracted %d frames, writing GIF to %s", len(frames), output_path)
@@ -191,3 +256,49 @@ def convert_to_gif(
         cap.release()
 
     return output_path
+
+
+def convert_video_folder_to_gifs(
+    input_dir: Path,
+    output_dir: Path,
+    override_fps: float | None = None,
+    settings: GifSettings | None = None,
+) -> list[Path]:
+    cfg = settings or GifSettings()
+
+    if not input_dir.exists():
+        raise FileNotFoundError(f"Input folder not found: {input_dir}")
+    if not input_dir.is_dir():
+        raise ValueError(f"Batch video input must be a directory: {input_dir}")
+
+    videos = _collect_video_files(input_dir)
+    if not videos:
+        raise ValueError(f"No video files found in folder: {input_dir}")
+
+    if output_dir.exists() and not output_dir.is_dir():
+        raise ValueError(f"Output path must be a directory: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    converted: list[Path] = []
+    failures: list[BatchConversionFailure] = []
+
+    for video_path in videos:
+        gif_path = output_dir / f"{video_path.stem}.gif"
+        try:
+            logging.info("Converting %s -> %s", video_path, gif_path)
+            converted.append(
+                convert_to_gif(
+                    video_path,
+                    gif_path,
+                    override_fps=override_fps,
+                    settings=cfg,
+                )
+            )
+        except Exception as exc:
+            logging.error("Failed to convert %s: %s", video_path, exc)
+            failures.append(BatchConversionFailure(video_path, str(exc)))
+
+    if failures:
+        raise BatchConversionError(converted, failures)
+
+    return converted
